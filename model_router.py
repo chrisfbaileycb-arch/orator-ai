@@ -212,6 +212,21 @@ def route(role: str, prompt: str, system: str = "", mode: str = "paid") -> str:
         return call_openrouter(prompt, system, model=model)
 
 
+def route_safe(role: str, prompt: str, system: str = "", mode: str = "paid") -> str:
+    """
+    Never-throw wrapper around route(). Returns empty string when no provider
+    is configured or every provider fails — callers fall back to the
+    deterministic template pipeline.
+    """
+    if not (OPENAI_API_KEY or GEMINI_API_KEY or OPENROUTER_API_KEY):
+        return ""
+    try:
+        return route(role, prompt, system, mode)
+    except Exception as e:
+        print(f"[ModelRouter] route_safe({role}) failed: {e}")
+        return ""
+
+
 # ============================================================
 # Convenience helpers
 # ============================================================

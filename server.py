@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Orator.AI Platform - Core Ephemeral Server & SSE Stream Engine
-Continuous 16+ Model MoE Rotation, WebGL Orb Bindings, 10 Knowledge Repos & 22-Point Audit Suite
+Continuous Multi-Model MoE Rotation, WebGL Orb Bindings, 11 Knowledge Repos & 22-Point Audit Suite
 Zero hard-drive footprint for manufactured codebases; in-memory packaging, preview, and streaming.
 """
 
@@ -13,19 +13,19 @@ import mimetypes
 import time
 import io
 import zipfile
-import hashlib
 import uuid
 import threading
 import sys
+from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
 
 # Import templates, knowledge engine, audit engine, and shift state machine
 sys.path.insert(0, os.path.dirname(__file__))
 from templates.single_session_template import generate_single_session_package
 from templates.citadel_template import generate_citadel_package
-from backend_knowledge import get_all_knowledge_repos, find_knowledge_by_domain, MODEL_PROVIDERS, DEPLOYMENT_OPTIONS
-from audit_engine import run_comprehensive_audit, AUDIT_CATEGORIES
-from shift_engine import global_shift_engine, ShiftState
+from backend_knowledge import get_all_knowledge_repos, MODEL_PROVIDERS, DEPLOYMENT_OPTIONS
+from audit_engine import run_comprehensive_audit
+from shift_engine import global_shift_engine, shift_registry, ShiftState
 import model_router
 
 
@@ -35,11 +35,23 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 # Ephemeral in-memory session cache & free/paid tracker
 active_sessions = {}
 latest_manufactured_files = {}
-free_sessions = {}  # { client_id: count_used }
-paid_clients = set()  # { client_id }
+latest_manufactured_lock = threading.Lock()
+free_sessions = {}   # { client_id: count_used }
+paid_clients = set() # { client_id }
+build_history = []   # ledger of completed builds -> powers real telemetry
+_telemetry_lock = threading.Lock()
+
+FREE_SESSION_LIMIT = 3
+FILES_LOCK = threading.Lock()
+
+
+def iso_now() -> str:
+    """Strict ISO-8601 UTC timestamp used on every API/SSE response."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 def get_client_id(handler):
-    """Very simple client identification for free/paid tier."""
+    """Client identification for free/paid tier (header > query param > IP)."""
     client_id = handler.headers.get("X-Orator-Client-Id")
     if client_id:
         return client_id
@@ -52,18 +64,52 @@ def get_client_id(handler):
         pass
     return handler.client_address[0]
 
+
 def can_use_free_session(client_id: str) -> bool:
-    used = free_sessions.get(client_id, 0)
-    return used < 3
+    return free_sessions.get(client_id, 0) < FREE_SESSION_LIMIT
+
 
 def consume_free_session(client_id: str):
     free_sessions[client_id] = free_sessions.get(client_id, 0) + 1
 
+
 def has_paid(client_id: str) -> bool:
     return client_id in paid_clients
 
+
 def mark_as_paid(client_id: str):
     paid_clients.add(client_id)
+
+
+def record_build(client_id, system_name, tier, file_count, composite_score, mode):
+    """Append to the build ledger. Real numbers drive the HUD telemetry."""
+    with _telemetry_lock:
+        build_history.append({
+            "id": f"build_{len(build_history) + 1:04d}",
+            "client_id": client_id,
+            "system": system_name,
+            "tier": tier,
+            "files": file_count,
+            "audit_score": composite_score,
+            "mode": mode,
+            "completed_at": time.time(),
+        })
+        return len(build_history)
+
+
+def telemetry_snapshot():
+    """Real telemetry from the build ledger — no synthetic jitter."""
+    with _telemetry_lock:
+        total = len(build_history)
+        recent = [b for b in build_history if time.time() - b["completed_at"] < 86400]
+        avg = round(sum(b["audit_score"] for b in build_history) / total, 1) if total else 0.0
+        return {
+            "total_builds": total,
+            "builds_last_24h": len(recent),
+            "average_audit_score": avg,
+            "registered_clients": shift_registry.client_count(),
+        }
+
 
 # 15 Ground-Truth Ingestion Questions Definition
 INGESTION_QUESTIONS = [
@@ -222,6 +268,7 @@ ROTATION_MATRIX = [
     }
 ]
 
+
 def compute_anti_slop_evaluation(prompt_text, moat_text=""):
     combined = f"{prompt_text} {moat_text}".lower()
     slop_indicators = [
@@ -233,22 +280,22 @@ def compute_anti_slop_evaluation(prompt_text, moat_text=""):
         ("crypto casino", "Regulatory and security hazard without verified custody protocol."),
         ("social network for", "Zero network-effect moat detected.")
     ]
-    
+
     score = 85
     flags = []
     challenge = None
-    
+
     for term, reason in slop_indicators:
         if term in combined:
             score -= 40
             flags.append(reason)
-            
+
     if len(prompt_text.strip()) < 15:
         score -= 30
         flags.append("Prompt is critically underspecified.")
-        
+
     score = max(5, min(99, score))
-    
+
     if score < 70:
         challenges = [
             "This matches known clone heuristics. What makes your algorithmic execution defensible against a 2-person engineering team copying this in 48 hours?",
@@ -256,14 +303,29 @@ def compute_anti_slop_evaluation(prompt_text, moat_text=""):
             "Moat verification failed. How does your system guarantee defensibility without external vendor lock-in?"
         ]
         challenge = challenges[int(time.time()) % len(challenges)]
-        
+
     return {
         "score": score,
         "passed": score >= 70,
         "flags": flags,
         "challenge": challenge,
-        "timestamp": time.time()
+        "timestamp": iso_now()
     }
+
+
+def _default_scope():
+    return {
+        "name": "Orator-Autonomous-App",
+        "tier": "complete",
+        "tier_label": "$99 Complete Digital Build",
+        "description": "Sub-millisecond air-gapped software appliance with lockless state machine.",
+        "moat": "Zero-disk in-memory deterministic state engine with continuous SHA-256 state chain verification.",
+        "auth": "Stateless Air-Gapped JWT",
+        "entities": ["Principal (id, email)", "LedgerState (id, payload, signature)"],
+        "routes": ["GET /api/v1/health", "POST /api/v1/auth/login", "POST /api/v1/mutate"],
+        "hosting": "Fly.io / Vercel / Docker"
+    }
+
 
 def process_conversational_turn(messages):
     last_msg = messages[-1]["content"] if messages else ""
@@ -306,7 +368,7 @@ def process_conversational_turn(messages):
     elif "citadel" in last_msg_lower or "enterprise" in last_msg_lower or "multi-tenant" in last_msg_lower:
         scope = {
             "name": "Citadel-Enterprise-Cloud",
-            "tier": "complete",
+            "tier": "citadel",
             "tier_label": "$99 Complete Digital Build",
             "description": "Multi-tenant high-throughput enterprise governance platform with row-level tenant isolation.",
             "moat": "Cryptographic tenant partition isolation with sub-millisecond distributed batch worker scheduling.",
@@ -363,6 +425,7 @@ def process_conversational_turn(messages):
         "phase": "BLUEPRINT"
     }
 
+
 class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         sys.stdout.write(f"[{self.log_date_time_string()}] {format % args}\n")
@@ -372,7 +435,7 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Orator-Client-Id")
         self.end_headers()
 
     def do_GET(self):
@@ -383,10 +446,11 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, {
                 "status": "ONLINE",
                 "system": "Orator.AI Digital Manufacturing Appliance",
-                "version": "3.4.0-ORATOR-ORACLE-REDESIGN",
+                "version": "3.5.0-ORATOR-ORACLE-POLISHED",
                 "knowledge_repos_indexed": 11,
                 "sse_stream": "ACTIVE",
-                "timestamp": time.time()
+                "telemetry": telemetry_snapshot(),
+                "timestamp": iso_now()
             })
             return
 
@@ -415,7 +479,7 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._handle_manufacture_sse_stream()
             return
 
-        if path.startswith("/api/preview"):
+        if path == "/api/preview":
             self._serve_live_preview()
             return
 
@@ -423,10 +487,24 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
             self._serve_download_zip()
             return
 
+        if path == "/api/state":
+            client_id = get_client_id(self)
+            engine = shift_registry.engine_for(client_id)
+            snap = engine.get_state_snapshot()
+            self._send_json(200, {
+                "client_id": client_id,
+                "shift_state": snap["current_state"],
+                "total_shifts": snap["total_shifts"],
+                "free_sessions_used": free_sessions.get(client_id, 0),
+                "free_sessions_remaining": max(0, FREE_SESSION_LIMIT - free_sessions.get(client_id, 0)),
+                "has_paid": has_paid(client_id),
+                "telemetry": telemetry_snapshot(),
+            })
+            return
+
         self._serve_static(path)
 
     def do_POST(self):
-        global latest_manufactured_files
         parsed = urlparse(self.path)
         path = parsed.path
 
@@ -444,22 +522,25 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
             messages = body.get("messages", [])
             result = process_conversational_turn(messages)
             if result.get("scope_ready"):
-                global_shift_engine.shift_to(ShiftState.BLUEPRINT_LOCKED, "15-Question scope locked.")
+                client_id = get_client_id(self)
+                engine = shift_registry.engine_for(client_id)
+                engine.try_shift(ShiftState.BLUEPRINT_LOCKED, "15-Question scope locked.")
             self._send_json(200, result)
-            return
-
-        elif path == "/api/stream-manufacture":
-            scope = body.get("scope")
-            mode = body.get("mode")
-            self._handle_manufacture_sse_stream(scope=scope, mode=mode)
             return
 
         elif path == "/api/mark-paid":
             client_id = body.get("client_id") or get_client_id(self)
             mark_as_paid(client_id)
+            engine = shift_registry.engine_for(client_id)
+            engine.try_shift(
+                ShiftState.DEPOSIT_AUTHORIZED,
+                "Execution slot authorized.",
+                {"tier": body.get("tier", "complete"), "amount_usd": body.get("amount", 99)},
+            )
             self._send_json(200, {
                 "status": "PAID",
                 "client_id": client_id,
+                "shift_state": engine.current_state,
                 "message": "Client marked as paid. Full manufacturing unlocked."
             })
             return
@@ -479,14 +560,14 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
                 "filename": file_name,
                 "file_type": file_type,
                 "summary": summary,
-                "timestamp": time.time()
+                "timestamp": iso_now()
             })
             return
 
         elif path == "/api/audit":
-
             spec = body.get("spec", {"name": "Orator-App"})
-            files = latest_manufactured_files if latest_manufactured_files else {}
+            with FILES_LOCK:
+                files = dict(latest_manufactured_files)
             audit_result = run_comprehensive_audit(spec, files)
             self._send_json(200, audit_result)
             return
@@ -519,14 +600,12 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
                 "entities": body.get("entities", []),
                 "routes": body.get("routes", [])
             }
-            if tier == "citadel":
-                files = generate_citadel_package(spec)
-            else:
-                files = generate_single_session_package(spec)
+            files = generate_citadel_package(spec) if tier == "citadel" else generate_single_session_package(spec)
 
-            latest_manufactured_files = files
+            with FILES_LOCK:
+                latest_manufactured_files.clear()
+                latest_manufactured_files.update(files)
 
-            # Run 22-point audit on generated files
             audit_report = run_comprehensive_audit(spec, files)
 
             self._send_json(200, {
@@ -541,17 +620,20 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
             })
             return
 
+        elif path == "/api/stream-manufacture":
+            scope = body.get("scope")
+            mode = body.get("mode")
+            self._handle_manufacture_sse_stream(scope=scope, mode=mode)
+            return
+
         else:
             self._send_json(404, {"error": f"Endpoint not found: {path}"})
 
+    # ------------------------------------------------------------------
+    # SSE: rotation telemetry stream (GET /api/stream)
+    # ------------------------------------------------------------------
     def _handle_sse_stream(self):
-        """Streams live SSE events for model rotation, token ticks, and mind map unlocks."""
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
+        self._sse_headers()
 
         def send_sse_event(event_type, data):
             payload = f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
@@ -559,7 +641,7 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.flush()
 
         try:
-            send_sse_event("stream_connected", {"status": "STREAM_ONLINE", "timestamp": time.time()})
+            send_sse_event("stream_connected", {"status": "STREAM_ONLINE", "timestamp": iso_now()})
             for step in ROTATION_MATRIX:
                 send_sse_event("model_dispatch", {
                     "step": step["skill_idx"],
@@ -571,22 +653,14 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
                     "repo_source": step["repo_source"],
                     "task": step["task_desc"]
                 })
-                time.sleep(0.5)  # Realistic delay between steps
-
-            send_sse_event("audit_summary", {
-                "total_audits": 22,
-                "composite_score": 98.4,
-                "pass_rate": "100%"
-            })
+                time.sleep(0.5)
             send_sse_event("stream_complete", {"status": "STREAM_FINISHED"})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         except Exception:
             pass
 
-    def _handle_manufacture_sse_stream(self, scope=None, mode=None):
-        """
-        Real multi-model manufacturing stream with Model Router integration.
-        Emits real-time skill steps, connects model calls, and packages live assets.
-        """
+    def _sse_headers(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -594,25 +668,34 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
+    # ------------------------------------------------------------------
+    # SSE: the forge (GET or POST /api/stream-manufacture)
+    # ------------------------------------------------------------------
+    def _handle_manufacture_sse_stream(self, scope=None, mode=None):
+        self._sse_headers()
+
         def emit(event_type, data):
             try:
                 payload = f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
                 self.wfile.write(payload)
                 self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                raise ConnectionAbortedError()
             except Exception:
                 pass
 
         client_id = get_client_id(self)
+        engine = shift_registry.engine_for(client_id)
 
+        # ----- Allowance gate (server-side, authoritative) -----
         if mode is None:
             if can_use_free_session(client_id):
                 mode = "free"
-                consume_free_session(client_id)
             elif has_paid(client_id):
                 mode = "paid"
             else:
                 emit("payment_required", {
-                    "message": "You have used your 3 free practice builds. A $99 payment is required for full manufacturing.",
+                    "message": f"You have used your {FREE_SESSION_LIMIT} free practice builds. A $99 payment is required for full manufacturing.",
                     "price": 99,
                     "currency": "USD",
                     "client_id": client_id
@@ -626,278 +709,184 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
                 "mode": mode,
                 "client_id": client_id,
                 "free_sessions_used": free_sessions.get(client_id, 0),
-                "timestamp": time.time()
+                "timestamp": iso_now()
             })
 
-            # Retrieve active scope or default
-            if not scope:
-                scope = {
-                    "name": "Orator-Autonomous-App",
-                    "description": "Sub-millisecond air-gapped software appliance with lockless state machine.",
-                    "moat": "Zero-disk in-memory deterministic state engine with continuous SHA-256 state chain verification.",
-                    "entities": ["Principal (id, email)", "LedgerState (id, payload, signature)"],
-                    "routes": ["GET /api/v1/health", "POST /api/v1/auth/login", "POST /api/v1/mutate"]
-                }
+            engine.try_shift(ShiftState.MANUFACTURING, f"Forge pipeline started ({mode} mode).")
+
+            scope = scope or _default_scope()
+
+            # Skill definitions for the 8-step pipeline. The LLM-augmented
+            # steps (1,2,3,5) call live models when keys are configured and
+            # fall back silently to the deterministic template otherwise.
+            skills = [
+                {"step": 1, "skill": "Architecture & Specs", "mcp": "OpenAPI-Contract-MCP", "repo": "shift.git",
+                 "primary": "Claude 3.7 Sonnet" if mode == "paid" else "Gemini 2.0 Flash",
+                 "secondary": "Mistral Large", "task": "Synthesizing immutable SPEC.md and formal architecture contract"},
+                {"step": 2, "skill": "DB Schema & WAL", "mcp": "DB-Schema-MCP", "repo": "full-stack-ai-agent.git",
+                 "primary": "Qwen 2.5 Coder 32B", "secondary": "DeepSeek-R1",
+                 "task": "Generating database schema and authentication boundary"},
+                {"step": 3, "skill": "API Scaffolding", "mcp": "Execution-Context-MCP", "repo": "ecc.git",
+                 "primary": "GPT-4o" if mode == "paid" else "GPT-4o-mini", "secondary": "Qwen 2.5 Coder",
+                 "task": "Compiling backend routes, models and server engine"},
+                {"step": 4, "skill": "Security & Enclave RBAC", "mcp": "Hallmark-Crypto-MCP", "repo": "hallmark.git",
+                 "primary": "Cohere Command-R+", "secondary": "Claude 3.5 Sonnet",
+                 "task": "Generating constant-time HMAC tokens & tenant partition guards"},
+                {"step": 5, "skill": "Reactive Frontend", "mcp": "Screenshot-To-Code-MCP", "repo": "screenshot-to-code.git",
+                 "primary": "Gemini 2.0 Flash", "secondary": "Claude 3.5",
+                 "task": "Generating single-file responsive Web HUD"},
+                {"step": 6, "skill": "Agent Swarm DAG", "mcp": "LangGraph-Cyclic-MCP", "repo": "langgraph.git",
+                 "primary": "Llama 3.3 70B", "secondary": "LangGraph Cyclic",
+                 "task": "Constructing autonomous worker hierarchy and task DAG matrix"},
+                {"step": 7, "skill": "Token Optimizer", "mcp": "FreeToken-Optimizer-MCP", "repo": "free-token.git",
+                 "primary": "DeepSeek-R1", "secondary": "FreeToken Optimizer",
+                 "task": "Applying zero-waste KV cache pruning and AST deduplication"},
+                {"step": 8, "skill": "22-Point Audit Invariants", "mcp": "Contract-Lock-MCP", "repo": "shift.git",
+                 "primary": "Claude 3.5 Sonnet" if mode == "paid" else "GPT-4o-mini",
+                 "secondary": "Orator Consensus",
+                 "task": "Final review, 22-point invariant audit, and air-gapped packaging"},
+            ]
 
             has_live_keys = bool(model_router.OPENAI_API_KEY or model_router.GEMINI_API_KEY or model_router.OPENROUTER_API_KEY)
+            live_outputs = {}
 
-            # --------------------------------------------------
-            # Step 1: Architecture & Specs
-            # --------------------------------------------------
-            emit("skill_start", {
-                "step": 1,
-                "skill": "Architecture & Specs",
-                "primary_model": "Claude 3.5 Sonnet" if mode == "paid" else "Gemini 2.0 Flash",
-                "secondary_model": "Mistral Large",
-                "moe_consensus": "Verified",
-                "mcp_connector": "OpenAPI-Contract-MCP",
-                "repo_source": "shift.git",
-                "task": "Synthesizing immutable SPEC.md and formal architecture contract",
-                "progress_pct": 0
-            })
+            def run_live_skill(skill_key, router_fn, prompt, system):
+                """Run a live model call; record output + timing, never raise."""
+                if not has_live_keys:
+                    return
+                t0 = time.time()
+                out = router_fn(prompt=prompt, system=system, mode=mode)
+                if out:
+                    live_outputs[skill_key] = {
+                        "content": out,
+                        "duration_s": round(time.time() - t0, 2),
+                    }
 
-            architecture_output = ""
-            if has_live_keys:
-                try:
-                    architecture_output = model_router.architect(
-                        prompt=f"Create a clean, production-ready architecture and SPEC.md for system:\n{json.dumps(scope, indent=2)}",
-                        system="You are a senior software architect. Output only the architecture and SPEC.md content.",
-                        mode=mode
+            scope_json = json.dumps(scope, indent=2)
+
+            for sk in skills:
+                emit("skill_start", {
+                    "step": sk["step"],
+                    "skill": sk["skill"],
+                    "primary_model": sk["primary"],
+                    "secondary_model": sk["secondary"],
+                    "moe_consensus": "Verified",
+                    "mcp_connector": sk["mcp"],
+                    "repo_source": sk["repo"],
+                    "task": sk["task"],
+                    "progress_pct": int((sk["step"] - 1) * 100 / 8),
+                    "live": has_live_keys and sk["step"] in (1, 2, 3, 5),
+                })
+
+                if sk["step"] == 1:
+                    run_live_skill(
+                        "architect", model_router.route_safe,
+                        f"Create a clean, production-ready architecture and SPEC.md for system:\n{scope_json}",
+                        "You are a senior software architect. Output only the architecture and SPEC.md content.",
                     )
-                except Exception as e:
-                    print(f"[ModelRouter] Step 1 live call fallback: {e}")
-
-            time.sleep(0.65)
-            emit("skill_complete", {
-                "step": 1,
-                "skill": "Architecture & Specs",
-                "status": "COMPLETED",
-                "progress_pct": 14
-            })
-
-            # --------------------------------------------------
-            # Step 2: DB Schema & WAL
-            # --------------------------------------------------
-            emit("skill_start", {
-                "step": 2,
-                "skill": "DB Schema & WAL",
-                "primary_model": "Qwen 2.5 Coder 32B",
-                "secondary_model": "DeepSeek-R1",
-                "moe_consensus": "Verified",
-                "mcp_connector": "DB-Schema-MCP",
-                "repo_source": "full-stack-ai-agent.git",
-                "task": "Generating database schema and authentication boundary",
-                "progress_pct": 14
-            })
-
-            schema_output = ""
-            if has_live_keys:
-                try:
-                    schema_output = model_router.schema(
-                        prompt=f"Create SQL database schema and auth DDL for:\n{architecture_output or json.dumps(scope)}",
-                        system="You are a database and security specialist. Output clean SQL schema only.",
-                        mode=mode
+                elif sk["step"] == 2:
+                    arch = live_outputs.get("architect", {}).get("content", "") or scope_json
+                    run_live_skill(
+                        "schema", model_router.route_safe,
+                        f"Create SQL database schema and auth DDL for:\n{arch[:4000]}",
+                        "You are a database and security specialist. Output clean SQL schema only.",
                     )
-                except Exception as e:
-                    print(f"[ModelRouter] Step 2 live call fallback: {e}")
-
-            time.sleep(0.70)
-            emit("skill_complete", {
-                "step": 2,
-                "skill": "DB Schema & WAL",
-                "status": "COMPLETED",
-                "progress_pct": 28
-            })
-
-            # --------------------------------------------------
-            # Step 3: API Scaffolding
-            # --------------------------------------------------
-            emit("skill_start", {
-                "step": 3,
-                "skill": "API Scaffolding",
-                "primary_model": "GPT-4o" if mode == "paid" else "GPT-4o-mini",
-                "secondary_model": "Qwen 2.5 Coder",
-                "moe_consensus": "Verified",
-                "mcp_connector": "Execution-Context-MCP",
-                "repo_source": "ecc.git",
-                "task": "Compiling backend routes, models and server engine",
-                "progress_pct": 28
-            })
-
-            backend_output = ""
-            if has_live_keys:
-                try:
-                    backend_output = model_router.backend(
-                        prompt=f"Create the complete backend code (Python) based on:\n{architecture_output or json.dumps(scope)}\nSCHEMA:\n{schema_output}",
-                        system="You are a senior backend engineer. Output complete, runnable Python backend code.",
-                        mode=mode
+                elif sk["step"] == 3:
+                    arch = live_outputs.get("architect", {}).get("content", "") or scope_json
+                    schema = live_outputs.get("schema", {}).get("content", "")
+                    run_live_skill(
+                        "backend", model_router.route_safe,
+                        f"Create the complete backend code (Python) based on:\n{arch[:4000]}\nSCHEMA:\n{schema[:3000]}",
+                        "You are a senior backend engineer. Output complete, runnable Python backend code.",
                     )
-                except Exception as e:
-                    print(f"[ModelRouter] Step 3 live call fallback: {e}")
-
-            time.sleep(0.70)
-            emit("skill_complete", {
-                "step": 3,
-                "skill": "API Scaffolding",
-                "status": "COMPLETED",
-                "progress_pct": 42
-            })
-
-            # --------------------------------------------------
-            # Step 4: Security & Enclave RBAC
-            # --------------------------------------------------
-            emit("skill_start", {
-                "step": 4,
-                "skill": "Security & Enclave RBAC",
-                "primary_model": "Cohere Command-R+",
-                "secondary_model": "Claude 3.5 Sonnet",
-                "moe_consensus": "Verified",
-                "mcp_connector": "Hallmark-Crypto-MCP",
-                "repo_source": "hallmark.git",
-                "task": "Generating constant-time HMAC tokens & tenant partition guards",
-                "progress_pct": 42
-            })
-            time.sleep(0.60)
-            emit("skill_complete", {
-                "step": 4,
-                "skill": "Security & Enclave RBAC",
-                "status": "COMPLETED",
-                "progress_pct": 56
-            })
-
-            # --------------------------------------------------
-            # Step 5: Reactive Frontend
-            # --------------------------------------------------
-            emit("skill_start", {
-                "step": 5,
-                "skill": "Reactive Frontend",
-                "primary_model": "Gemini 2.0 Flash",
-                "secondary_model": "Claude 3.5",
-                "moe_consensus": "Verified",
-                "mcp_connector": "Screenshot-To-Code-MCP",
-                "repo_source": "screenshot-to-code.git",
-                "task": "Generating single-file responsive Web HUD",
-                "progress_pct": 56
-            })
-
-            frontend_output = ""
-            if has_live_keys:
-                try:
-                    frontend_output = model_router.frontend(
-                        prompt=f"Create a clean, modern single-page frontend (HTML + CSS + JS) that matches:\n{architecture_output or json.dumps(scope)}",
-                        system="You are a frontend specialist. Output complete index.html and styles.",
-                        mode=mode
+                elif sk["step"] == 5:
+                    arch = live_outputs.get("architect", {}).get("content", "") or scope_json
+                    run_live_skill(
+                        "frontend", model_router.route_safe,
+                        f"Create a clean, modern single-page frontend (HTML + CSS + JS) that matches:\n{arch[:4000]}",
+                        "You are a frontend specialist. Output complete index.html and styles.",
                     )
-                except Exception as e:
-                    print(f"[ModelRouter] Step 5 live call fallback: {e}")
 
-            time.sleep(0.70)
-            emit("skill_complete", {
-                "step": 5,
-                "skill": "Reactive Frontend",
-                "status": "COMPLETED",
-                "progress_pct": 70
-            })
+                time.sleep(0.65)  # deliberate pacing for the HUD deck
 
-            # --------------------------------------------------
-            # Step 6: Agent Swarm DAG
-            # --------------------------------------------------
-            emit("skill_start", {
-                "step": 6,
-                "skill": "Agent Swarm DAG",
-                "primary_model": "Llama 3.3 70B",
-                "secondary_model": "LangGraph Cyclic",
-                "moe_consensus": "Verified",
-                "mcp_connector": "LangGraph-Cyclic-MCP",
-                "repo_source": "langgraph.git",
-                "task": "Constructing autonomous worker hierarchy and task DAG matrix",
-                "progress_pct": 70
-            })
-            time.sleep(0.65)
-            emit("skill_complete", {
-                "step": 6,
-                "skill": "Agent Swarm DAG",
-                "status": "COMPLETED",
-                "progress_pct": 84
-            })
+                # Attach live-model latency when this step produced a real call.
+                step_output_key = {1: "architect", 2: "schema", 3: "backend", 5: "frontend"}.get(sk["step"])
+                extra = {}
+                if step_output_key and step_output_key in live_outputs:
+                    extra["live_latency_s"] = live_outputs[step_output_key]["duration_s"]
 
-            # --------------------------------------------------
-            # Step 7: Token Optimizer
-            # --------------------------------------------------
-            emit("skill_start", {
-                "step": 7,
-                "skill": "Token Optimizer",
-                "primary_model": "DeepSeek-R1",
-                "secondary_model": "FreeToken Optimizer",
-                "moe_consensus": "Verified",
-                "mcp_connector": "FreeToken-Optimizer-MCP",
-                "repo_source": "free-token.git",
-                "task": "Applying zero-waste KV cache pruning and AST deduplication",
-                "progress_pct": 84
-            })
-            time.sleep(0.55)
-            emit("skill_complete", {
-                "step": 7,
-                "skill": "Token Optimizer",
-                "status": "COMPLETED",
-                "progress_pct": 92
-            })
+                emit("skill_complete", {
+                    "step": sk["step"],
+                    "skill": sk["skill"],
+                    "status": "COMPLETED",
+                    "progress_pct": int(sk["step"] * 100 / 8),
+                    **extra,
+                })
 
-            # --------------------------------------------------
-            # Step 8: Final 22-Point Invariant Audit & Packaging
-            # --------------------------------------------------
-            emit("skill_start", {
-                "step": 8,
-                "skill": "22-Point Audit Invariants",
-                "primary_model": "Claude 3.5 Sonnet" if mode == "paid" else "GPT-4o-mini",
-                "secondary_model": "Orator Consensus",
-                "moe_consensus": "Verified",
-                "mcp_connector": "Contract-Lock-MCP",
-                "repo_source": "shift.git",
-                "task": "Final review, 22-point invariant audit, and air-gapped packaging",
-                "progress_pct": 92
-            })
+            # ----- Package generation (deterministic template + live overlays) -----
+            template_package = generate_citadel_package(scope) if scope.get("tier") == "citadel" else generate_single_session_package(scope)
 
-            # Generate full template package
-            template_package = generate_single_session_package(scope)
-            global latest_manufactured_files
-            latest_manufactured_files = template_package
+            # Live model outputs override the deterministic template files.
+            if "architect" in live_outputs:
+                template_package["SPEC.md"] = live_outputs["architect"]["content"]
+            if "schema" in live_outputs:
+                template_package["schema.sql"] = live_outputs["schema"]["content"]
+            if "backend" in live_outputs:
+                template_package["server/routes.py"] = live_outputs["backend"]["content"]
+            if "frontend" in live_outputs and "<html" in live_outputs["frontend"]["content"].lower():
+                template_package["client/index.html"] = live_outputs["frontend"]["content"]
 
-            if architecture_output:
-                latest_manufactured_files["SPEC.md"] = architecture_output
-            if schema_output:
-                latest_manufactured_files["schema.sql"] = schema_output
-            if backend_output:
-                latest_manufactured_files["server.py"] = backend_output
+            with FILES_LOCK:
+                latest_manufactured_files.clear()
+                latest_manufactured_files.update(template_package)
 
-            audit_res = run_comprehensive_audit(scope, latest_manufactured_files)
+            audit_res = run_comprehensive_audit(scope, template_package)
+            total_files = len(template_package)
+            build_seq = record_build(
+                client_id, scope.get("name", "orator-app"), scope.get("tier", "complete"),
+                total_files, audit_res.get("composite_score", 0), mode,
+            )
 
-            time.sleep(0.60)
-            emit("skill_complete", {
-                "step": 8,
-                "skill": "22-Point Audit Invariants",
-                "status": "COMPLETED",
-                "progress_pct": 100
-            })
+            engine.try_shift(ShiftState.AUDIT_PASSED, f"22-point audit complete: {audit_res.get('composite_score')}")
+            engine.try_shift(ShiftState.SANDBOX_UNLOCKED, "Live sandbox + ZIP delivery unlocked.")
+
+            # Consume free allowance only after a successful run.
+            if mode == "free":
+                consume_free_session(client_id)
 
             emit("audit_complete", {
-                "composite_score": audit_res.get("composite_score", 98.4),
-                "pass_rate": "100%",
-                "total_checks": 22,
-                "all_passed": True
+                "composite_score": audit_res.get("composite_score", 0),
+                "total_checks": audit_res.get("total_audits_evaluated", 22),
+                "failed_checks": audit_res.get("failed_checks", []),
+                "all_passed": audit_res.get("all_passed", False),
+                "categories": audit_res.get("categories", []),
+                "verification_seal": audit_res.get("verification_seal", {}),
             })
 
             emit("package_ready", {
                 "status": "PACKAGE_READY",
                 "download_endpoint": "/api/download-zip",
+                "sandbox_endpoint": "/api/preview",
                 "sandbox_footprint_bytes": 0,
+                "memory_resident_kb": round(sum(len(c) for c in template_package.values()) / 1024, 1),
+                "file_count": total_files,
+                "files": list(template_package.keys()),
+                "build_seq": build_seq,
+                "mode": mode,
                 "message": "Manufacturing complete. Air-gapped package ready."
             })
 
+        except ConnectionAbortedError:
+            pass
         except Exception as e:
-            emit("error", {"message": str(e)})
+            try:
+                emit("error", {"message": str(e)})
+            except Exception:
+                pass
 
-
+    # ------------------------------------------------------------------
+    # Delivery helpers
+    # ------------------------------------------------------------------
     def _send_json(self, status, data):
         raw = json.dumps(data).encode("utf-8")
         self.send_response(status)
@@ -908,15 +897,19 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _serve_live_preview(self):
-        global latest_manufactured_files
-        html_content = latest_manufactured_files.get("client/index.html")
-        css_content = latest_manufactured_files.get("client/styles.css")
-        js_content = latest_manufactured_files.get("client/app.js")
+        with FILES_LOCK:
+            files = dict(latest_manufactured_files)
+        html_content = files.get("client/index.html")
+        css_content = files.get("client/styles.css")
+        js_content = files.get("client/app.js")
 
         if not html_content:
             html_content = """<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ORATOR.AI // Live Sandbox Idle</title>
   <style>
     body { background: #06090e; color: #38bdf8; font-family: monospace; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
     .box { text-align: center; border: 1px solid rgba(56,189,248,0.3); padding: 30px; border-radius: 10px; background: rgba(10,16,32,0.8); }
@@ -928,7 +921,7 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
   <div class="box">
     <div class="pulse"></div>
     <h3>ORATOR.AI // LIVE SANDBOX IDLE</h3>
-    <p style="color: #94a3b8; font-size: 0.85rem;">Lock scope and authorize $25 deposit to start live multi-agent execution & 22-point audit.</p>
+    <p style="color: #94a3b8; font-size: 0.85rem;">Lock a blueprint and authorize your execution slot to start live multi-agent manufacturing and the 22-point audit.</p>
   </div>
 </body>
 </html>"""
@@ -970,30 +963,28 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(content_bytes)
 
     def _serve_download_zip(self, spec=None, tier="single"):
-        global latest_manufactured_files
-        if spec is None:
-            spec = {
+        with FILES_LOCK:
+            files = dict(latest_manufactured_files)
+
+        if not files:
+            spec = spec or {
                 "name": "orator-manufactured-app",
                 "description": "High-performance air-gapped system.",
                 "moat": "Zero external SaaS dependencies with deterministic in-memory execution.",
                 "entities": ["AuthPrincipal (id, email, role)", "MasterResource (id, title, payload, owner_id)"],
                 "routes": ["GET /api/v1/health", "POST /api/v1/auth/login", "GET /api/v1/resources", "POST /api/v1/resources"]
             }
+            files = generate_citadel_package(spec) if tier == "citadel" else generate_single_session_package(spec)
+            with FILES_LOCK:
+                latest_manufactured_files.clear()
+                latest_manufactured_files.update(files)
 
-        if latest_manufactured_files:
-            file_map = latest_manufactured_files
-        else:
-            if tier == "citadel":
-                file_map = generate_citadel_package(spec)
-            else:
-                file_map = generate_single_session_package(spec)
-            latest_manufactured_files = file_map
-
-        filename = f"{spec.get('name', 'orator-app')}-airgapped.zip"
+        spec = spec or {}
+        filename = f"{spec.get('name', 'orator-app') or 'orator-app'}-airgapped.zip"
 
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for file_path, content in file_map.items():
+            for file_path, content in files.items():
                 zf.writestr(file_path, content)
 
         zip_bytes = zip_buffer.getvalue()
@@ -1010,15 +1001,25 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
         if path in ("/", ""):
             path = "/index.html"
         clean = path.lstrip("/")
-        full_path = os.path.join(STATIC_DIR, clean)
 
-        if os.path.exists(full_path) and os.path.isfile(full_path):
+        # Path traversal guard: resolve and verify containment in STATIC_DIR.
+        base = os.path.realpath(STATIC_DIR)
+        full_path = os.path.realpath(os.path.join(STATIC_DIR, clean))
+        if not (full_path == base or full_path.startswith(base + os.sep)):
+            self.send_response(403)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"403 Forbidden")
+            return
+
+        if os.path.isfile(full_path):
             mime, _ = mimetypes.guess_type(full_path)
             with open(full_path, "rb") as f:
                 content = f.read()
             self.send_response(200)
             self.send_header("Content-Type", mime or "application/octet-stream")
             self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(content)
@@ -1028,16 +1029,19 @@ class OrchestratorHTTPHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"404 Asset Not Found")
 
+
 def run():
     socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.ThreadingTCPServer(("", PORT), OrchestratorHTTPHandler) as httpd:
+    with socketserver.ThreadingTCPServer(("0.0.0.0", PORT), OrchestratorHTTPHandler) as httpd:
         print(f"================================================================")
-        print(f"   ORATOR.AI - 10-REPOSITORY BACKEND KNOWLEDGE APPLIANCE")
-        print(f"   Listening on: http://localhost:{PORT}")
+        print(f"   ORATOR.AI - 11-REPOSITORY BACKEND KNOWLEDGE APPLIANCE")
+        print(f"   Listening on: http://0.0.0.0:{PORT}")
         print(f"   SSE Stream: Active // 22-Point Comprehensive Audit Engine")
         print(f"   0 Bytes Hard-Drive Footprint // Ephemeral In-Memory Sandbox")
         print(f"================================================================")
+        sys.stdout.flush()
         httpd.serve_forever()
+
 
 if __name__ == "__main__":
     run()

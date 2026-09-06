@@ -4,3 +4,11 @@ __pycache__/
 .DS_Store
 *.zip
 .env
+.env.*
+!.env.example
+
+# Node / Vite
+node_modules/
+dist/
+*.local
+*.tsbuildinfo

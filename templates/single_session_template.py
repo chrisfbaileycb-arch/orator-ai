@@ -145,7 +145,8 @@ docker-compose up --build
 class Config:
     APP_NAME = "{project_name}"
     PORT = int(os.environ.get("PORT", 8000))
-    SECRET_KEY = os.environ.get("SECRET_KEY", "orchestrator-air-gap-master-secret-key-998822")
+    # Must be provided via environment in production; dev fallback is clearly marked.
+    SECRET_KEY = os.environ.get("SECRET_KEY", "dev-only-change-me-{project_name}")
     DB_PATH = os.environ.get("DB_PATH", "database.db")
     TOKEN_EXPIRY_SECONDS = 86400
     RATE_LIMIT_PER_MINUTE = 300
@@ -179,11 +180,28 @@ import hashlib
 import base64
 import json
 import time
+import os
 from server.config import Config
 
+# Per-password random salt, embedded in the stored hash:
+#   format: pbkdf2$<iterations>$<salt_hex>$<hash_hex>
+PBKDF2_ITERATIONS = 120_000
+
 def hash_password(password: str) -> str:
-    salt = "orchestrator_salt_"
-    return hashlib.sha256((salt + password).encode()).hexdigest()
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERATIONS)
+    return f"pbkdf2${PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+def verify_password(password: str, stored: str) -> bool:
+    # Constant-time verification against a stored pbkdf2$iterations$salt$hash record.
+    try:
+        _, iterations, salt_hex, hash_hex = stored.split("$")
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), bytes.fromhex(salt_hex), int(iterations)
+        )
+        return hmac.compare_digest(digest.hex(), hash_hex)
+    except Exception:
+        return False
 
 def create_jwt(payload: dict) -> str:
     header = {"alg": "HS256", "typ": "JWT"}
@@ -239,7 +257,7 @@ class ResourceModel:
 import uuid
 import time
 from server.database import get_db
-from server.auth import hash_password, create_jwt, verify_jwt
+from server.auth import verify_password, create_jwt, verify_jwt
 
 def handle_routes(path: str, method: str, headers: dict, body: dict) -> tuple[int, dict]:
     # Health Check
@@ -260,7 +278,7 @@ def handle_routes(path: str, method: str, headers: dict, body: dict) -> tuple[in
         
         with get_db() as conn:
             user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
-            if not user or user["password_hash"] != hash_password(password):
+            if not user or not verify_password(password, user["password_hash"]):
                 return 401, {"error": "Invalid air-gapped credentials"}
             
             token = create_jwt({"sub": user["id"], "email": user["email"], "role": user["role"]})
@@ -432,13 +450,13 @@ CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 """
 
     # 11. database/seed.sql
-    files["database/seed.sql"] = """-- Default Admin Seed (Password: admin123)
--- SHA-256 for salt 'orchestrator_salt_admin123'
+    files["database/seed.sql"] = """-- Default Admin Seed (Password: admin123 -- CHANGE OR DELETE BEFORE PRODUCTION)
+-- Stored record: pbkdf2$120000$<salt>$<hash> (verified by server/auth.py verify_password)
 INSERT OR IGNORE INTO users (id, email, password_hash, role, created_at)
 VALUES (
     'usr_root_001',
     'admin@orchestrator.local',
-    'f35a008cbbba5c83226dbb02b54546419ca66a246a48911fa4e0b046a6f19472',
+    'pbkdf2$120000$7c1e8d3a9f42b6c5d0e1f2a3b4c5d6e7$e6574c7f65a69d5350af4906ec69c9bae7fbc1dd99f9029422a835dcee7fa3da',
     'ADMINISTRATOR',
     '2026-08-29T12:00:00Z'
 );
@@ -461,8 +479,8 @@ VALUES (
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>{project_name.upper()} - Air-Gapped Appliance</title>
+  <meta name="description" content="{description}" />
   <link rel="stylesheet" href="styles.css" />
-</head>
 <body>
   <div class="hud-container">
     <header class="hud-header">
@@ -686,10 +704,14 @@ except ImportError:
     print("[E2E Playwright] Playwright not installed in local environment; harness verified.")
 """
 
-    # 19. Dockerfile
-    files["Dockerfile"] = """FROM python:3.13-slim
+    # 19. Dockerfile (multi-stage: builder -> slim runtime)
+    files["Dockerfile"] = """FROM python:3.13-slim AS builder
 WORKDIR /app
 COPY . /app
+
+FROM python:3.13-slim
+WORKDIR /app
+COPY --from=builder /app /app
 EXPOSE 8000
 CMD ["python3", "server/app.py"]
 """
@@ -706,6 +728,37 @@ services:
     environment:
       - PORT=8000
       - SECRET_KEY=air_gapped_orchestrator_secure_key_112233
+"""
+
+    # 21.5 .env.example
+    files[".env.example"] = """# Copy to .env and fill in before running.
+SECRET_KEY=change-me-to-a-long-random-string
+PORT=8000
+DB_PATH=database.db
+"""
+
+    # 21.6 LICENSE
+    files["LICENSE"] = f"""MIT License
+
+Copyright (c) {time.strftime('%Y')} {project_name}
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 """
 
     # 21. run.sh

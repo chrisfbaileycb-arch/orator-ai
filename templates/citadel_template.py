@@ -212,7 +212,8 @@ import hashlib
 import json
 import time
 
-SECRET = "citadel-enterprise-master-secret-key-3344"
+import os
+SECRET = os.environ.get("CITADEL_SECRET_KEY", "dev-only-change-me-citadel")  # set via environment in production
 
 class TenantManager:
     def __init__(self):
@@ -318,6 +319,7 @@ ALTER TABLE users ENABLE ROW LEVEL SECURITY;
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>{project_name.upper()} - Citadel Command Deck</title>
+  <meta name="description" content="{description}" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -363,9 +365,21 @@ ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 """
 
     # 9. client/styles.css
-    files["client/styles.css"] = """* { box-sizing: border-box; margin: 0; padding: 0; }
+    files["client/styles.css"] = """:root {
+  --bg-obsidian: #06090e;
+  --bg-panel: #161b22;
+  --bg-input: #0d1117;
+  --border-glass: #30363d;
+  --color-cyan: #58a6ff;
+  --color-violet: #a371f7;
+  --color-emerald: #3fb950;
+  --text-main: #f0f6fc;
+  --text-muted: #8b949e;
+  --radius-md: 8px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
 body {
-  background: #06090e;
+  background: var(--bg-obsidian);
   color: #c9d1d9;
   font-family: 'JetBrains Mono', 'Segoe UI', monospace;
   min-height: 100vh;
@@ -455,12 +469,74 @@ services:
     restart: unless-stopped
 """
 
-    # 12. infra/Dockerfile.citadel
-    files["infra/Dockerfile.citadel"] = """FROM python:3.13-slim
+    # 12. infra/Dockerfile.citadel (multi-stage: deps -> slim runtime)
+    files["infra/Dockerfile.citadel"] = """FROM python:3.13-slim AS builder
 WORKDIR /app
 COPY . /app
+
+FROM python:3.13-slim
+WORKDIR /app
+COPY --from=builder /app /app
 EXPOSE 8080
 CMD ["python3", "gateway/server.py"]
+"""
+
+    # 13. LICENSE
+    files["LICENSE"] = f"""MIT License
+
+Copyright (c) {time.strftime('%Y')} {project_name}
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
+    # 14. .env.example
+    files[".env.example"] = """# Copy to .env and fill in before running.
+CITADEL_SECRET_KEY=change-me-to-a-long-random-string
+GATEWAY_PORT=8080
+"""
+
+    # 15. tests/test_tenant_isolation.py
+    files["tests/test_tenant_isolation.py"] = """import unittest
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from services.auth_tenant.manager import TenantManager
+
+
+class TestTenantIsolation(unittest.TestCase):
+    def setUp(self):
+        self.manager = TenantManager()
+
+    def test_known_tenant_accepted(self):
+        self.assertTrue(self.manager.validate_tenant("tnt_alpha_01"))
+
+    def test_unknown_tenant_rejected(self):
+        self.assertFalse(self.manager.validate_tenant("tnt_does_not_exist"))
+
+    def test_token_carries_tenant_claim(self):
+        token = self.manager.generate_tenant_token("tnt_alpha_01", "usr_1", "ADMIN")
+        self.assertIn("tnt_alpha_01", token)
+
+
+if __name__ == "__main__":
+    unittest.main()
 """
 
     return files
